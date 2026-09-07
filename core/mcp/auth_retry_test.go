@@ -627,8 +627,14 @@ func TestExecuteTool_AuthFailureRetry_Shared_FallsBackWhenReconnectExceedsBudget
 	if err == nil {
 		t.Fatal("expected the original error to surface when the reconnect exceeds the budget")
 	}
-	if !errors.Is(err, ErrMCPToolCallFailed) {
-		t.Errorf("expected error to wrap ErrMCPToolCallFailed, got: %v", err)
+	// The caller's 300ms deadline is what capped the wait, so by the time the
+	// bounded wait gives up the tool call has run out of time. Callers classify
+	// on these sentinels (see mcpErrorType), so this has to read as a timeout
+	// rather than as a tool failure. The sibling
+	// ..._ReconnectFails_OriginalErrorSurfaces test covers the other branch:
+	// recovery failing with budget still left stays ErrMCPToolCallFailed.
+	if !errors.Is(err, ErrMCPToolTimeout) {
+		t.Errorf("expected error to wrap ErrMCPToolTimeout once the budget was consumed, got: %v", err)
 	}
 	if got := ft.CallCount(); got != 1 {
 		t.Errorf("expected no retry when the reconnect exceeds the budget, got %d CallTool invocations", got)
