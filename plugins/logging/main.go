@@ -2766,6 +2766,7 @@ func (p *LoggerPlugin) PreMCPHook(ctx *schemas.BifrostContext, req *schemas.Bifr
 	// Capture configured logging headers and x-bf-lh-* headers into metadata
 	entry.MetadataParsed = p.captureLoggingHeaders(ctx)
 
+	applyMCPObservation(ctx, entry)
 	p.pendingMCPLogsToInject.Store(mcpLogID, entry)
 
 	p.mu.Lock()
@@ -2910,6 +2911,7 @@ func (p *LoggerPlugin) PostMCPHook(ctx *schemas.BifrostContext, resp *schemas.Bi
 	p.mu.Unlock()
 	attachMCPLogRedactionData(ctx, entry, p.contentLoggingEnabled(ctx))
 	entry.PluginLogs = serializePluginLogs(ctx.GetPluginLogs())
+	applyMCPObservation(ctx, entry)
 	p.enqueueMCPToolLogEntry(entry, callback)
 
 	return resp, bifrostErr, nil
