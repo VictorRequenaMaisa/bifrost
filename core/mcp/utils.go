@@ -91,6 +91,7 @@ var ProbeRetryConfig = RetryConfig{
 	MaxRetries:     3,
 	InitialBackoff: 500 * time.Millisecond,
 	MaxBackoff:     4 * time.Second,
+	IsRetryable:    isTransientProbeError,
 }
 
 // ToolCallRetryConfig backs the live tool-call invocation itself
@@ -256,23 +257,24 @@ func isTransientError(err error) bool {
 		return false
 	}
 
-	// Permanent errors that should NOT be retried
-	permanentErrors := []string{
-		// Authentication/authorization errors
-		"401", "403", "unauthorized", "forbidden", "invalid auth", "invalid credential",
-		// HTTP client errors
-		"400", "405", "422", "bad request", "method not allowed",
-		// Configuration errors
-		"command not found", "no such file", "not found", "permission denied",
-		"invalid config",
-		// Command execution errors
-		"executable file not found", "permission denied", "command failed",
-		// Timeout errors - if something times out, retrying won't help
-		"timeout", "deadline exceeded", "waiting for endpoint",
+	for _, permanentErr := range permanentErrorPhrases {
+		if strings.Contains(strings.ToLower(errStr), permanentErr) {
+			return false
+		}
 	}
 
-	for _, permanentErr := range permanentErrors {
-		if strings.Contains(strings.ToLower(errStr), permanentErr) {
+	// Bare digits, deliberately: a collision cannot change this classifier's
+	// answer, because the timeout loop below would reject the same text anyway.
+	for _, status := range permanentHTTPStatusCodes {
+		if strings.Contains(strings.ToLower(errStr), status) {
+			return false
+		}
+	}
+
+	// Timeouts are permanent here specifically because this classifier backs
+	// connection establishment; see timeoutErrorSubstrings.
+	for _, timeoutErr := range timeoutErrorSubstrings {
+		if strings.Contains(strings.ToLower(errStr), timeoutErr) {
 			return false
 		}
 	}
@@ -300,6 +302,49 @@ func isTransientError(err error) bool {
 	// but flips this default.
 	return true
 }
+
+// permanentErrorPhrases is what "retrying cannot help" looks like in words:
+// a rejected credential, a misconfiguration, a command that cannot run. Every
+// classifier in this file treats these as permanent, and they outrank a timeout
+// appearing in the same text, because "command failed: timeout" is a dead
+// command that happens to mention a timeout rather than a slow one.
+var permanentErrorPhrases = []string{
+	// Authentication/authorization errors
+	"unauthorized", "forbidden", "invalid auth", "invalid credential",
+	// HTTP client errors
+	"bad request", "method not allowed",
+	// Configuration errors
+	"command not found", "no such file", "not found", "permission denied",
+	"invalid config",
+	// Command execution errors
+	"executable file not found", "permission denied", "command failed",
+}
+
+// permanentHTTPStatusCodes is the same idea by status code rather than by
+// wording, held apart from the phrases because three digits collide with
+// ordinary parts of an error message in a way a phrase never does: a port
+// (8422), a latency (400ms), a byte count.
+//
+// The two classifiers therefore match them differently. isTransientError uses
+// bare substrings, which is harmless there because it also treats every
+// timeout as permanent, so a collision cannot change its answer.
+// isTransientProbeError cannot afford that, because it checks permanent
+// markers *before* deciding a timeout is retryable: see its own comment.
+var permanentHTTPStatusCodes = []string{"400", "401", "403", "405", "422"}
+
+// timeoutErrorSubstrings is what "did not complete in time" looks like. The two
+// classifiers split on it rather than on its contents: isTransientError treats
+// every entry as permanent, because for connection establishment a timeout
+// usually means the endpoint is wrong or unreachable and the same dial will
+// time out again, while isTransientProbeError treats every entry as retryable,
+// because over an already-established connection a timeout is the most
+// retryable failure there is.
+//
+// Both iterate this one list on purpose. Spelling the phrases out at either
+// call site invites exactly the asymmetry that existed before: a probe that
+// retried "timeout" and "deadline exceeded" but not "waiting for endpoint",
+// which then fell through and was classified permanent.
+var timeoutErrorSubstrings = []string{"timeout", "deadline exceeded", "waiting for endpoint"}
 
 // transientErrorSubstrings is the shared substring list both isTransientError
 // (connection-establishment, default-retry-unknown) and
@@ -421,6 +466,74 @@ func isDeadSessionErrorText(errStr string) bool {
 		}
 	}
 	return false
+}
+
+// isTransientProbeError is ProbeRetryConfig's classifier, for the periodic
+// connection checker's own ping / list_tools calls. It differs from the shared
+// isTransientError in two ways, both because a probe runs over an
+// already-established connection instead of establishing one:
+//
+//   - A timeout is retryable here. isTransientError's blanket "if something
+//     times out, retrying won't help" fits a dial, where a timeout usually
+//     means the endpoint is wrong or unreachable. ConnectionCheckTimeout is 5
+//     seconds, so without this one slow response from a busy upstream spends
+//     none of the retry budget the probe exists to absorb blips with, marking
+//     the client Unstable on the first attempt and, now that a failed check
+//     reconnects, churning a working session over a single hiccup. The worst
+//     case this admits (four 5-second attempts plus the config's ~3.5s of
+//     backoff per operation) is what any unrecognized connection error already
+//     costs on this path.
+//   - A dead session is permanent, via the same classifier the reactive
+//     tool-call path uses. mcp-go clears its session id and returns
+//     ErrSessionTerminated on a 404 without re-initializing, so every retry
+//     over this connection fails identically; only a reconnect repairs it, and
+//     retrying first just delays that by the whole backoff schedule.
+//
+// Auth rejections are checked before the timeout rule for the same reason
+// isTransientToolCallError checks them first: error text like "403 forbidden:
+// timeout" must not fall into the timeout branch.
+func isTransientProbeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	if isDeadSessionErrorText(errStr) {
+		return false
+	}
+	// Checked before the timeout rule, not after: an error carrying any
+	// permanent marker is permanent even when its text also says "timeout"
+	// (auth rejections among them, since they are phrases on this list).
+	// Letting the timeout branch run first would make "status 422: timeout" or
+	// "command failed: timeout" retryable, which is strictly worse than the
+	// shared classifier they would otherwise fall through to.
+	for _, permanentErr := range permanentErrorPhrases {
+		if strings.Contains(errStr, permanentErr) {
+			return false
+		}
+	}
+	// Status codes only in status position, never as bare digits. Checking
+	// permanent markers ahead of the timeout rule is what makes that
+	// distinction load-bearing: a bare match would read the port in "dial tcp
+	// 127.0.0.1:8422: i/o timeout", or the latency in "i/o timeout after
+	// 400ms", as a permanent status and mark a client Unstable on the first
+	// attempt, spending none of the retry budget this classifier exists to
+	// spend. Matching narrowly is the safer error of the two: a status form
+	// this misses costs a few wasted retries, while a false positive recreates
+	// that bug.
+	for _, status := range permanentHTTPStatusCodes {
+		if strings.Contains(errStr, "status "+status) || strings.Contains(errStr, "status: "+status) {
+			return false
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	for _, timeoutErr := range timeoutErrorSubstrings {
+		if strings.Contains(errStr, timeoutErr) {
+			return true
+		}
+	}
+	return isTransientError(err)
 }
 
 // ExecuteWithRetry executes a function with exponential backoff retry logic.
