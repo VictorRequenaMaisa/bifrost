@@ -146,7 +146,7 @@ export const mcpApi = baseApi.injectEndpoints({
 						dispatch(mcpApi.util.invalidateTags(["MCPClients"]));
 						break;
 					}
-				} catch {}
+				} catch { }
 			},
 		}),
 
@@ -195,7 +195,7 @@ export const mcpApi = baseApi.injectEndpoints({
 							}),
 						);
 					}
-				} catch {}
+				} catch { }
 			},
 		}),
 
@@ -223,7 +223,7 @@ export const mcpApi = baseApi.injectEndpoints({
 							}),
 						);
 					}
-				} catch {}
+				} catch { }
 			},
 		}),
 
@@ -247,10 +247,30 @@ export const mcpApi = baseApi.injectEndpoints({
 			invalidatesTags: ["MCPClients"],
 		}),
 
-		// Get OAuth config status (for polling)
-		getOAuthConfigStatus: builder.query<OAuthStatusResponse, string>({
-			query: (oauthConfigId) => `/oauth/config/${oauthConfigId}/status`,
-			providesTags: (result, error, id) => [{ type: "OAuth2Config", id }],
+		// Re-discover an MCP client's tools from its upstream server now, rather
+		// than waiting out the tool sync interval (10 minutes by default). Applies
+		// to every client type, including the per-call ones Reconnect cannot act on.
+		refreshMCPClientTools: builder.mutation<{ status: string; message: string; tool_count: number }, string>({
+			query: (id) => ({
+				url: `/mcp/client/${id}/refresh-tools`,
+				method: "POST",
+			}),
+			invalidatesTags: ["MCPClients"],
+		}),
+
+		// Get OAuth config status (for polling). Pass flowId for a reauthorize
+		// flow: the config's own status never leaves "authorized" once a client
+		// has been verified, so only the flow row can say whether this consent
+		// has actually completed.
+		getOAuthConfigStatus: builder.query<OAuthStatusResponse, string | { oauthConfigId: string; flowId?: string }>({
+			query: (arg) => {
+				const { oauthConfigId, flowId } = typeof arg === "string" ? { oauthConfigId: arg, flowId: undefined } : arg;
+				return {
+					url: `/oauth/config/${oauthConfigId}/status`,
+					...(flowId && { params: { flow_id: flowId } }),
+				};
+			},
+			providesTags: (result, error, arg) => [{ type: "OAuth2Config", id: typeof arg === "string" ? arg : arg.oauthConfigId }],
 		}),
 
 		// Complete OAuth flow for MCP client
