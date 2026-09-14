@@ -87,7 +87,7 @@ func (mc *ModelCatalog) computeModelsForProvider(provider schemas.ModelProvider)
 			out = append(out, alias)
 		}
 		for _, m := range e.Allowed {
-			if m == "*" || blacklisted.IsBlocked(m) {
+			if m == "*" || schemas.IsRegexEntry(m) || blacklisted.IsBlocked(m) {
 				continue
 			}
 			if _, ok := seen[m]; ok {
@@ -322,6 +322,11 @@ func (mc *ModelCatalog) IsModelAllowedForProvider(provider schemas.ModelProvider
 	// Bare-name match needs no catalog access and covers most allowlists.
 	if slices.Contains(allowedModels, model) {
 		return true
+	}
+	for _, entry := range allowedModels {
+		if schemas.IsRegexEntry(entry) && (schemas.MatchEntry(entry, model) || schemas.MatchEntry(entry, string(provider)+"/"+model)) {
+			return true
+		}
 	}
 
 	// Only provider-prefixed entries ("openai/gpt-4o") need the provider
